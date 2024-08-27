@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"golang.org/x/time/rate"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -80,4 +81,75 @@ func (limiter *Limiter) Take() {
 	default:
 		<-limiter.tokens
 	}
+}
+
+// CanTake 检查限速器是否有 Token
+func (limiter *Limiter) CanTake() bool {
+	switch limiter.strategy {
+	case LeakyBucket:
+		return limiter.leakyBucketLimiter.Tokens() > 0
+	default:
+		return limiter.count.Load() > 0
+	}
+}
+
+func (limiter *Limiter) GetLimit() uint {
+	return uint(limiter.maxCount.Load())
+}
+
+func (limiter *Limiter) SetLimit(max uint) {
+	limiter.maxCount.Store(uint32(max))
+	switch limiter.strategy {
+	case LeakyBucket:
+		limiter.leakyBucketLimiter.SetBurst(int(max))
+	default:
+
+	}
+}
+
+func (limiter *Limiter) Stop() {
+	switch limiter.strategy {
+	case LeakyBucket:
+	default:
+		if limiter.cancelFunc != nil {
+			limiter.cancelFunc()
+		}
+	}
+}
+
+func (limiter *Limiter) SetDuration(d time.Duration) {
+	limiter.interval = d
+	switch limiter.strategy {
+	case LeakyBucket:
+		limiter.leakyBucketLimiter.SetLimit(rate.Every(d))
+	default:
+		limiter.ticker.Reset(d)
+	}
+}
+
+// NewUnlimited create a bucket with approximated unlimited tokens
+func NewUnlimited(ctx context.Context) *Limiter {
+	internalctx, cancel := context.WithCancel(context.TODO())
+	limiter := &Limiter{
+		ticker:     time.NewTicker(time.Millisecond),
+		tokens:     make(chan struct{}),
+		ctx:        ctx,
+		cancelFunc: cancel,
+	}
+	limiter.maxCount.Store(math.MaxUint32)
+	limiter.count.Store(math.MaxUint32)
+	go limiter.run(internalctx)
+
+	return limiter
+}
+
+// NewUnlimited create a bucket with approximated unlimited tokens
+func NewLeakyBucket(ctx context.Context, max uint, duration time.Duration) *Limiter {
+	limiter := &Limiter{
+		strategy:           LeakyBucket,
+		leakyBucketLimiter: rate.NewLimiter(rate.Every(duration), int(max)),
+	}
+	limiter.maxCount.Store(uint32(max))
+	limiter.interval = duration
+	return limiter
 }
