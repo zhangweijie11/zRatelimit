@@ -1,51 +1,83 @@
 package ratelimit
 
 import (
-	"github.com/benbjohnson/clock"
+	"context"
+	"golang.org/x/time/rate"
+	"sync/atomic"
 	"time"
 )
 
-type Clock interface {
-	Now() time.Time
-	Sleep(duration time.Duration)
+type Strategy uint8
+
+const (
+	None Strategy = iota
+	LeakyBucket
+)
+
+// 用于计数器的递减操作
+var minusOne = ^uint32(0)
+
+type Limiter struct {
+	strategy           Strategy
+	maxCount           atomic.Uint32
+	interval           time.Duration
+	count              atomic.Uint32
+	ticker             *time.Ticker
+	tokens             chan struct{}
+	ctx                context.Context
+	cancelFunc         context.CancelFunc
+	leakyBucketLimiter *rate.Limiter
 }
 
-type config struct {
-	clock Clock
-	slack int
-	per   time.Duration
-}
+func New(ctx context.Context, max uint, duration time.Duration) *Limiter {
+	internalCtx, cancel := context.WithCancel(context.TODO())
 
-type Option interface {
-	apply(*config)
-}
-
-type Limiter interface {
-	Take() time.Time
-}
-
-func New(rate int, opts ...Option) Limiter {
-	return newAtomicInt64Based(rate, opts...)
-}
-
-func buildConfig(opts []Option) config {
-	c := config{
-		clock: clock.New(),
-		slack: 10,
-		per:   time.Second,
+	maxCount := &atomic.Uint32{}
+	maxCount.Store(uint32(max))
+	limiter := &Limiter{
+		strategy:   None,
+		interval:   duration,
+		ticker:     time.NewTicker(duration),
+		tokens:     make(chan struct{}),
+		ctx:        ctx,
+		cancelFunc: cancel,
 	}
 
-	for _, opt := range opts {
-		opt.apply(&c)
+	limiter.maxCount.Store(uint32(max))
+	limiter.count.Store(uint32(max))
+
+	go limiter.run(internalCtx)
+
+	return limiter
+}
+
+func (limiter *Limiter) run(ctx context.Context) {
+	defer close(limiter.tokens)
+	for {
+		if limiter.count.Load() == 0 {
+			<-limiter.ticker.C
+			limiter.count.Store(limiter.maxCount.Load())
+		}
+		select {
+		case <-ctx.Done():
+			limiter.ticker.Stop()
+			return
+		case <-limiter.ctx.Done():
+			limiter.ticker.Stop()
+			return
+		case limiter.tokens <- struct{}{}:
+			limiter.count.Add(minusOne)
+		case <-limiter.ticker.C:
+			limiter.count.Store(limiter.maxCount.Load())
+		}
 	}
-
-	return c
 }
 
-type slackOption int
-
-func (o slackOption) apply(c *config) {
-	c.slack = int(0)
+func (limiter *Limiter) Take() {
+	switch limiter.strategy {
+	case LeakyBucket:
+		_ = limiter.leakyBucketLimiter.Wait(context.TODO())
+	default:
+		<-limiter.tokens
+	}
 }
-
-var WithoutSlack Option = slackOption(0)
